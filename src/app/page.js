@@ -100,10 +100,92 @@ function getGroupLabel(lang, regionId, group) {
   return group;
 }
 
+// ─── IP Geolocation ─────────────────────────────────────────────────
+// Uses server-side proxy (/api/geo) which calls ip-api.com batch endpoint
+// and caches results in server memory. This avoids CORS issues on some
+// deployments and provides fast cached lookups on repeat scans.
+const geoCache = new Map();
+
+// Convert country code to flag emoji (regional indicator symbols)
+function countryToFlag(code) {
+  if (!code || code.length !== 2) return "";
+  const offset = 0x1f1e6 - 65; // 'A' = 65
+  return String.fromCodePoint(
+    code.charCodeAt(0) + offset,
+    code.charCodeAt(1) + offset
+  );
+}
+
+// Batched geo lookup: collects IPs and flushes in a single server-side batch
+const geoQueue = {
+  pending: new Set(),
+  timer: null,
+  callback: null,
+  enqueue(ip) {
+    if (geoCache.has(ip)) {
+      if (this.callback) this.callback(ip, geoCache.get(ip));
+      return;
+    }
+    this.pending.add(ip);
+    // Debounce: flush batch after short delay to collect multiple IPs
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.flush(), 300);
+  },
+  async flush() {
+    if (this.pending.size === 0) return;
+    const ips = [...this.pending];
+    this.pending.clear();
+
+    // Filter out already cached
+    const uncached = ips.filter((ip) => !geoCache.has(ip));
+    // Emit cached ones immediately
+    for (const ip of ips) {
+      if (geoCache.has(ip) && this.callback) {
+        this.callback(ip, geoCache.get(ip));
+      }
+    }
+
+    if (uncached.length === 0) return;
+
+    try {
+      const res = await fetch("/api/geo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ips: uncached }),
+      });
+      if (!res.ok) throw new Error("batch geo failed");
+      const { results } = await res.json();
+      for (const ip of uncached) {
+        const r = results[ip] || {};
+        const info = {
+          flag: countryToFlag((r.country_code || "").toUpperCase()),
+          country: r.country || "",
+          org: r.org || "",
+        };
+        geoCache.set(ip, info);
+        if (this.callback) this.callback(ip, info);
+      }
+    } catch {
+      // Mark all as empty on failure
+      for (const ip of uncached) {
+        const empty = { flag: "", country: "", org: "" };
+        geoCache.set(ip, empty);
+        if (this.callback) this.callback(ip, empty);
+      }
+    }
+  },
+};
+
 // ─── Ping measurement ───────────────────────────────────────────────
 // Uses Resource Timing API to extract TCP handshake duration (connectEnd - connectStart).
 // TCP handshake = exactly 1 RTT, same as ICMP ping.
 // Falls back to performance.now() wall-clock timing if Resource Timing unavailable.
+//
+// Correction coefficient: TCP connect via browser may include minor overhead
+// (process scheduling, JS event loop). A factor of 0.95 compensates for typical
+// browser-side overhead so the displayed value more closely matches ICMP ping.
+// Set to 1.0 to disable correction.
+const PING_CORRECTION_FACTOR = 0.95;
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
 
@@ -172,16 +254,20 @@ async function measurePing(ip, port = 4000, attempts = 3) {
   // Use median for stability
   results.sort((a, b) => a - b);
   const median = results[Math.floor(results.length / 2)];
-  return Math.round(median);
+  // Apply correction coefficient to compensate for browser overhead
+  return Math.max(1, Math.round(median * PING_CORRECTION_FACTOR));
 }
 
 // ─── Region definitions ─────────────────────────────────────────────
 const REGIONS = [
   { id: "asianormal", labelKey: "asia", hasGroups: true },
   { id: "usnormal", labelKey: "naeu", hasGroups: true },
-  { id: "asiatest", labelKey: "asiaTest", hasGroups: false },
-  { id: "ustest", labelKey: "naeuTest", hasGroups: false },
+  // Test servers — kept for reference but disabled from display
+  { id: "asiatest", labelKey: "asiaTest", hasGroups: false, disabled: true },
+  { id: "ustest", labelKey: "naeuTest", hasGroups: false, disabled: true },
 ];
+
+const ACTIVE_REGIONS = REGIONS.filter((r) => !r.disabled);
 
 // ─── Main component ─────────────────────────────────────────────────
 export default function Home() {
@@ -189,15 +275,30 @@ export default function Home() {
   const [scanning, setScanning] = useState(false);
   const [hasScanned, setHasScanned] = useState(false);
   const [regionData, setRegionData] = useState({});
+  const [geoInfo, setGeoInfo] = useState({}); // { [ip]: { flag, country, org } }
+
+  // Ref so ping callbacks can trigger geo lookups without stale closure
+  const geoSetterRef = useRef(setGeoInfo);
+  geoSetterRef.current = setGeoInfo;
 
   const startScan = useCallback(async () => {
     setScanning(true);
     setHasScanned(true);
     const newData = {};
 
+    // Set up geo queue callback to update state as results arrive
+    geoQueue.callback = (ip, info) => {
+      geoSetterRef.current((prev) => ({ ...prev, [ip]: info }));
+    };
+
+    // Fire-and-forget geo lookup for a server that responded
+    const triggerGeo = (ip) => {
+      geoQueue.enqueue(ip);
+    };
+
     // Fetch all server lists in parallel
     const fetches = await Promise.allSettled(
-      REGIONS.map(async (region) => {
+      ACTIVE_REGIONS.map(async (region) => {
         try {
           const res = await fetch(`/api/servers?region=${region.id}`);
           const json = await res.json();
@@ -226,11 +327,12 @@ export default function Home() {
 
     setRegionData({ ...newData });
 
-    // Ping all regions in parallel
+    // Ping all regions in parallel, geo lookups triggered as pings complete
     await Promise.all(
-      REGIONS.map((region) =>
+      ACTIVE_REGIONS.map((region) =>
         pingRegion(region, newData, (updated) =>
-          setRegionData((prev) => ({ ...prev, ...updated }))
+          setRegionData((prev) => ({ ...prev, ...updated })),
+          triggerGeo
         )
       )
     );
@@ -268,13 +370,14 @@ export default function Home() {
 
         {/* Region panels */}
         <div style={styles.grid}>
-          {REGIONS.map((region) => (
+          {ACTIVE_REGIONS.map((region) => (
             <RegionPanel
               key={region.id}
               region={region}
               data={regionData[region.id]}
               lang={lang}
               scanning={scanning}
+              geoInfo={geoInfo}
             />
           ))}
         </div>
@@ -287,7 +390,7 @@ export default function Home() {
 }
 
 // ─── Ping a single region ────────────────────────────────────────────
-async function pingRegion(region, dataRef, onUpdate) {
+async function pingRegion(region, dataRef, onUpdate, triggerGeo) {
   const data = dataRef[region.id];
   if (!data || data.servers.length === 0) {
     onUpdate({
@@ -313,10 +416,13 @@ async function pingRegion(region, dataRef, onUpdate) {
     const groupAResults = { timeouts: 0, ups: 0, results: [] };
     const groupBResults = { timeouts: 0, ups: 0, results: [] };
 
+    // Asia: 3 timeouts to detect dead group, NA-EU: 5
+    const timeoutThreshold = region.id === "asianormal" ? 3 : 5;
+
     const pingGroup = async (items, stats, otherStats) => {
       for (const server of items) {
-        // Early termination: 5 timeouts in this group + 3 ups in other group
-        if (stats.timeouts >= 5 && otherStats.ups >= 3) {
+        // Early termination: N timeouts in this group + 3 ups in other group
+        if (stats.timeouts >= timeoutThreshold && otherStats.ups >= 3) {
           // Mark remaining as skipped (they belong to dead group)
           const currentIdx = items.indexOf(server);
           for (let j = currentIdx; j < items.length; j++) {
@@ -352,6 +458,9 @@ async function pingRegion(region, dataRef, onUpdate) {
           onUpdate,
           dataRef
         );
+
+        // Trigger geo lookup immediately for servers that responded
+        if (ping !== null && triggerGeo) triggerGeo(server.ip);
       }
     };
 
@@ -400,6 +509,7 @@ async function pingRegion(region, dataRef, onUpdate) {
       const ping = await measurePing(servers[i].ip, servers[i].port);
       const status = ping !== null ? "done" : "timeout";
       updateServer(region.id, i, { ping, status }, onUpdate, dataRef);
+      if (ping !== null && triggerGeo) triggerGeo(servers[i].ip);
     }
     dataRef[region.id] = { ...dataRef[region.id], done: true };
     onUpdate({ [region.id]: dataRef[region.id] });
@@ -415,7 +525,7 @@ function updateServer(regionId, index, updates, onUpdate, dataRef) {
 }
 
 // ─── Region Panel Component ─────────────────────────────────────────
-function RegionPanel({ region, data, lang, scanning }) {
+function RegionPanel({ region, data, lang, scanning, geoInfo }) {
   if (!data) {
     return (
       <div style={styles.panel}>
@@ -458,6 +568,22 @@ function RegionPanel({ region, data, lang, scanning }) {
     displayServers = [];
   }
   // If A+B: show all (both active)
+
+  // Sort: servers with ping results first (by ping asc), then in-progress, then timeouts
+  displayServers = [...displayServers].sort((a, b) => {
+    const order = (s) => {
+      if (s.ping !== null) return 0;          // responded — top
+      if (s.status === "measuring") return 1; // in progress
+      if (s.status === "waiting") return 2;   // queued
+      return 3;                                // timeout/skipped — bottom
+    };
+    const oa = order(a);
+    const ob = order(b);
+    if (oa !== ob) return oa - ob;
+    // Within responded servers, sort by ping ascending
+    if (a.ping !== null && b.ping !== null) return a.ping - b.ping;
+    return 0;
+  });
 
   // Stats (only from displayed servers)
   const doneServers = displayServers.filter(
@@ -544,6 +670,7 @@ function RegionPanel({ region, data, lang, scanning }) {
                 key={`${server.ip}-${i}`}
                 server={server}
                 lang={lang}
+                geo={geoInfo?.[server.ip]}
               />
             ))}
           </div>
@@ -562,7 +689,7 @@ function Stat({ label, value, accent }) {
   );
 }
 
-function ServerRow({ server, lang }) {
+function ServerRow({ server, lang, geo }) {
   const { ip, ping, status } = server;
 
   let pingDisplay;
@@ -598,10 +725,22 @@ function ServerRow({ server, lang }) {
           : "#555"
       : "transparent";
 
+  // Show geo info only for servers that responded
+  const showGeo = ping !== null && geo && (geo.flag || geo.country);
+
   return (
     <div style={styles.serverRow}>
       <div style={styles.serverInfo}>
         <span style={styles.serverIp}>{ip}</span>
+        {showGeo && (
+          <span style={styles.geoInfo}>
+            {geo.flag && <span style={styles.geoFlag}>{geo.flag}</span>}
+            {geo.country && (
+              <span style={styles.geoCountry}>{geo.country}</span>
+            )}
+            {geo.org && <span style={styles.geoOrg}>{geo.org}</span>}
+          </span>
+        )}
       </div>
       <div style={styles.pingSection}>
         <div style={styles.pingBar}>
@@ -754,7 +893,7 @@ const styles = {
   },
   panelBody: {
     padding: "0",
-    maxHeight: 400,
+    maxHeight: 600,
     overflowY: "auto",
   },
   emptyText: {
@@ -789,13 +928,42 @@ const styles = {
     alignItems: "center",
     gap: 8,
     minWidth: 0,
-    flexShrink: 0,
+    flex: 1,
+    overflow: "hidden",
   },
   serverIp: {
     fontFamily: "'JetBrains Mono', monospace",
     fontSize: 12,
     color: "#888",
     fontWeight: 400,
+    flexShrink: 0,
+  },
+  geoInfo: {
+    display: "flex",
+    alignItems: "center",
+    gap: 5,
+    minWidth: 0,
+    overflow: "hidden",
+  },
+  geoFlag: {
+    fontSize: 13,
+    flexShrink: 0,
+  },
+  geoCountry: {
+    fontSize: 11,
+    color: "#777",
+    fontWeight: 400,
+    whiteSpace: "nowrap",
+    flexShrink: 0,
+  },
+  geoOrg: {
+    fontSize: 10,
+    color: "#555",
+    fontWeight: 400,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    minWidth: 0,
   },
   pingSection: {
     display: "flex",
