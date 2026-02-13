@@ -64,7 +64,9 @@ export async function POST(request) {
               }
             : { country_code: "", country: "", org: "" };
 
-        geoCache.set(ip, info);
+        if (info.country_code || info.country || info.org) {
+          geoCache.set(ip, info);
+        }
         results[ip] = info;
       }
     } catch (e) {

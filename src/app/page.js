@@ -35,7 +35,7 @@ const STRINGS = {
     skipped: "Skipped",
     noData: "No server data available",
     fetchError: "Failed to fetch server list",
-    note: "Latency is measured in-browser via HTTPS fetch to port 4000. TCP handshake time from Resource Timing is used first. When unavailable, elapsed time until fetch error is used with a calibration factor.",
+    note: "Latency is measured in-browser via HTTPS fetch to port 4000. TCP handshake time from Resource Timing is used first. When unavailable, elapsed time until fetch error is corrected with an adaptive factor.",
     allGroupsDown: "All servers unreachable",
   },
   ja: {
@@ -70,7 +70,7 @@ const STRINGS = {
     skipped: "スキップ",
     noData: "サーバーデータを取得できません",
     fetchError: "サーバーリストの取得に失敗しました",
-    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間に補正係数を適用します。",
+    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間に可変補正係数を適用します。",
     allGroupsDown: "全サーバー到達不可",
   },
 };
@@ -162,14 +162,15 @@ const geoQueue = {
           country: r.country || "",
           org: r.org || "",
         };
-        geoCache.set(ip, info);
+        if (info.flag || info.country || info.org) {
+          geoCache.set(ip, info);
+        }
         if (this.callback) this.callback(ip, info);
       }
     } catch {
-      // Mark all as empty on failure
+      // Emit empty values but do not cache failure; allow retry on next scan
       for (const ip of uncached) {
         const empty = { flag: "", country: "", org: "" };
-        geoCache.set(ip, empty);
         if (this.callback) this.callback(ip, empty);
       }
     }
@@ -178,11 +179,25 @@ const geoQueue = {
 
 // ─── Ping measurement ───────────────────────────────────────────────
 // Browser-only measurement via HTTPS fetch + Resource Timing API.
-// If only fetch-error timing is available, apply a calibration factor.
+// If only fetch-error timing is available, apply adaptive calibration.
 const MIN_VALID_PING_MS = 1;
 const MAX_VALID_PING_MS = 4000;
 const REQUEST_TIMEOUT_MS = 4000;
-const FETCH_ERROR_CORRECTION_FACTOR = 0.23;
+const FETCH_ERROR_COEFF_BASE = 0.156;
+const FETCH_ERROR_COEFF_SLOPE = 0.000105;
+const FETCH_ERROR_COEFF_MIN = 0.16;
+const FETCH_ERROR_COEFF_MAX = 0.24;
+
+function calibrateFetchErrorMs(rawMs) {
+  const coeff = Math.min(
+    FETCH_ERROR_COEFF_MAX,
+    Math.max(
+      FETCH_ERROR_COEFF_MIN,
+      FETCH_ERROR_COEFF_BASE + rawMs * FETCH_ERROR_COEFF_SLOPE
+    )
+  );
+  return rawMs * coeff;
+}
 
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
@@ -254,7 +269,7 @@ async function measurePing(ip, port = 4000, attempts = 3) {
 
       if (sample !== null) {
         if (sampleSource === "fetch-error") {
-          sample = sample * FETCH_ERROR_CORRECTION_FACTOR;
+          sample = calibrateFetchErrorMs(sample);
         }
         results.push(sample);
       }
@@ -735,7 +750,7 @@ function ServerRow({ server, lang, geo }) {
   }
 
   // Show geo info only for servers that responded
-  const showGeo = ping !== null && geo && (geo.flag || geo.country);
+  const showGeo = ping !== null && geo && (geo.flag || geo.country || geo.org);
 
   return (
     <div className="server-row" style={styles.serverRow}>
