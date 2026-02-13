@@ -35,7 +35,7 @@ const STRINGS = {
     skipped: "Skipped",
     noData: "No server data available",
     fetchError: "Failed to fetch server list",
-    note: "Latency is measured in-browser via HTTPS fetch to port 4000. Only TCP connect timing from Resource Timing is used; if unavailable, the server is shown as Timeout.",
+    note: "Latency is measured in-browser via HTTPS fetch to port 4000. TCP handshake time from Resource Timing is used first; when unavailable, elapsed time until fetch error is used.",
     allGroupsDown: "All servers unreachable",
   },
   ja: {
@@ -70,7 +70,7 @@ const STRINGS = {
     skipped: "スキップ",
     noData: "サーバーデータを取得できません",
     fetchError: "サーバーリストの取得に失敗しました",
-    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間のみを使用し、取得できない場合はタイムアウト扱いになります。",
+    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間を使用します。",
     allGroupsDown: "全サーバー到達不可",
   },
 };
@@ -181,6 +181,7 @@ const geoQueue = {
 // No prediction/correction is applied.
 const MIN_VALID_PING_MS = 1;
 const MAX_VALID_PING_MS = 4000;
+const REQUEST_TIMEOUT_MS = 4000;
 
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
@@ -188,7 +189,7 @@ async function measurePing(ip, port = 4000, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
     const url = `https://${ip}:${port}/?_=${Date.now()}_${i}_${Math.random()}`;
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 4000);
+    const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
 
     try {
       const rtPromise = new Promise((resolve) => {
@@ -208,23 +209,46 @@ async function measurePing(ip, port = 4000, attempts = 3) {
         }, 5000);
       });
 
+      let fetchErrorName = "";
+      const t0 = performance.now();
       await fetch(url, {
         mode: "no-cors",
         cache: "no-store",
         signal: ac.signal,
-      }).catch(() => {});
+      }).catch((err) => {
+        fetchErrorName = err?.name || "";
+      });
+      const wallTime = performance.now() - t0;
 
       const entry = await rtPromise;
+      let sample = null;
       if (entry) {
         const tcp = entry.connectEnd - entry.connectStart;
         if (tcp >= MIN_VALID_PING_MS && tcp < MAX_VALID_PING_MS) {
-          results.push(tcp);
+          sample = tcp;
         } else if (entry.responseStart > 0 && entry.requestStart > 0) {
           const ttfb = entry.responseStart - entry.requestStart;
           if (ttfb >= MIN_VALID_PING_MS && ttfb < MAX_VALID_PING_MS) {
-            results.push(ttfb);
+            sample = ttfb;
           }
         }
+      }
+      if (sample === null) {
+        const likelyAbort =
+          ac.signal.aborted ||
+          fetchErrorName === "AbortError" ||
+          wallTime >= REQUEST_TIMEOUT_MS - 20;
+        if (
+          !likelyAbort &&
+          wallTime >= MIN_VALID_PING_MS &&
+          wallTime < MAX_VALID_PING_MS
+        ) {
+          sample = wallTime;
+        }
+      }
+
+      if (sample !== null) {
+        results.push(sample);
       }
     } catch {
       // timeout or network error
