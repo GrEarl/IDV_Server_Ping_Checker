@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 // ─── i18n ────────────────────────────────────────────────────────────
 const STRINGS = {
   en: {
-    subtitle: "Measure latency from your browser to each game server",
+    subtitle: "Measure latency to each game server with direct TCP connect checks",
     startScan: "Start Scan",
     scanning: "Scanning...",
     rescan: "Rescan",
@@ -35,11 +35,11 @@ const STRINGS = {
     skipped: "Skipped",
     noData: "No server data available",
     fetchError: "Failed to fetch server list",
-    note: "Latency is measured via TCP connection time to port 4000 over HTTPS from your browser. Values closely approximate ICMP ping (1 RTT).",
+    note: "Latency is measured by direct TCP connect time to port 4000 via the ping API. If direct measurement fails, an estimated fallback is used.",
     allGroupsDown: "All servers unreachable",
   },
   ja: {
-    subtitle: "ブラウザから各ゲームサーバーへの遅延を測定",
+    subtitle: "各ゲームサーバーへの遅延をTCP接続で測定",
     startScan: "スキャン開始",
     scanning: "スキャン中...",
     rescan: "再スキャン",
@@ -70,7 +70,7 @@ const STRINGS = {
     skipped: "スキップ",
     noData: "サーバーデータを取得できません",
     fetchError: "サーバーリストの取得に失敗しました",
-    note: "遅延はブラウザからHTTPS経由でポート4000へのTCP接続時間で測定しています。ICMPのpingに近い値（1 RTT）が得られます。",
+    note: "遅延は ping API によるポート4000へのTCP接続時間で測定しています。直接計測に失敗した場合のみ推定値フォールバックを使用します。",
     allGroupsDown: "全サーバー到達不可",
   },
 };
@@ -177,15 +177,51 @@ const geoQueue = {
 };
 
 // ─── Ping measurement ───────────────────────────────────────────────
-// Uses Resource Timing API to extract TCP handshake duration (connectEnd - connectStart).
-// TCP handshake = exactly 1 RTT, same as ICMP ping.
-// Falls back to performance.now() wall-clock timing if Resource Timing unavailable.
-//
-// TCP connect time (connectEnd - connectStart) = exactly 1 RTT, same as ICMP ping.
-// No correction needed since we measure the raw TCP handshake via Resource Timing.
-const PING_CORRECTION_FACTOR = 1.0;
+// Primary path: server-side TCP connect measurement (/api/ping).
+// Fallback path: browser-side estimate with correction factor when API path fails.
+const SERVER_PING_CORRECTION_FACTOR = 1.0;
+const FALLBACK_PING_CORRECTION_FACTOR = 0.2;
 const MIN_VALID_PING_MS = 1;
+const MAX_VALID_PING_MS = 4000;
+
 async function measurePing(ip, port = 4000, attempts = 3) {
+  const serverPing = await measurePingViaApi(ip, port, attempts);
+  if (serverPing !== null) return serverPing;
+  return measurePingFallback(ip, port, attempts);
+}
+
+async function measurePingViaApi(ip, port = 4000, attempts = 3) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 8000);
+
+  try {
+    const res = await fetch("/api/ping", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      signal: ac.signal,
+      body: JSON.stringify({ ip, port, attempts }),
+    });
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    if (typeof json.ping !== "number") return null;
+    if (json.ping < MIN_VALID_PING_MS || json.ping > MAX_VALID_PING_MS) {
+      return null;
+    }
+
+    return Math.max(
+      1,
+      Math.round(json.ping * SERVER_PING_CORRECTION_FACTOR)
+    );
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function measurePingFallback(ip, port = 4000, attempts = 3) {
   const results = [];
 
   for (let i = 0; i < attempts; i++) {
@@ -194,25 +230,6 @@ async function measurePing(ip, port = 4000, attempts = 3) {
     const timer = setTimeout(() => ac.abort(), 4000);
 
     try {
-      // Set up Resource Timing observer before fetch
-      const rtPromise = new Promise((resolve) => {
-        const observer = new PerformanceObserver((list) => {
-          for (const entry of list.getEntries()) {
-            if (entry.name === url) {
-              observer.disconnect();
-              resolve(entry);
-              return;
-            }
-          }
-        });
-        observer.observe({ type: "resource", buffered: true });
-        setTimeout(() => {
-          observer.disconnect();
-          resolve(null);
-        }, 5000);
-      });
-
-      // Also measure wall-clock time as fallback
       const t0 = performance.now();
       await fetch(url, {
         mode: "no-cors",
@@ -220,29 +237,14 @@ async function measurePing(ip, port = 4000, attempts = 3) {
         signal: ac.signal,
       }).catch(() => {});
       const wallTime = performance.now() - t0;
-
-      const entry = await rtPromise;
-
-      if (entry) {
-        // Best: TCP handshake time = exactly 1 RTT (same as ICMP ping)
-        const tcp = entry.connectEnd - entry.connectStart;
-        if (tcp >= MIN_VALID_PING_MS && tcp < 4000) {
-          results.push(tcp);
-        } else if (entry.responseStart > 0 && entry.requestStart > 0) {
-          const ttfb = entry.responseStart - entry.requestStart;
-          if (ttfb >= MIN_VALID_PING_MS && ttfb < 4000) results.push(ttfb);
-        } else if (wallTime >= MIN_VALID_PING_MS && wallTime < 4000) {
-          results.push(wallTime);
-        }
-      } else if (wallTime >= MIN_VALID_PING_MS && wallTime < 4000) {
+      if (wallTime >= MIN_VALID_PING_MS && wallTime < MAX_VALID_PING_MS) {
         results.push(wallTime);
       }
     } catch {
-      // timeout or network error
+      // timeout or network error in fallback path
     }
 
     clearTimeout(timer);
-    performance.clearResourceTimings();
 
     if (i < attempts - 1) {
       await new Promise((r) => setTimeout(r, 30));
@@ -250,11 +252,11 @@ async function measurePing(ip, port = 4000, attempts = 3) {
   }
 
   if (results.length === 0) return null;
-  // Use median for stability
   results.sort((a, b) => a - b);
   const median = results[Math.floor(results.length / 2)];
-  // Correction factor is 1.0 by default (raw TCP handshake RTT).
-  return Math.max(1, Math.round(median * PING_CORRECTION_FACTOR));
+
+  // Fallback estimate: browser TLS-failure wall clock is typically inflated.
+  return Math.max(1, Math.round(median * FALLBACK_PING_CORRECTION_FACTOR));
 }
 
 // ─── Region definitions ─────────────────────────────────────────────
