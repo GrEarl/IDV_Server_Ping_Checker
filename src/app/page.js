@@ -184,7 +184,7 @@ const geoQueue = {
 // TCP connect time (connectEnd - connectStart) = exactly 1 RTT, same as ICMP ping.
 // No correction needed since we measure the raw TCP handshake via Resource Timing.
 const PING_CORRECTION_FACTOR = 1.0;
-const MIN_VALID_PING_MS = 3;
+const MIN_VALID_PING_MS = 1;
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
 
