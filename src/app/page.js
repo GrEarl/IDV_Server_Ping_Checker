@@ -35,7 +35,7 @@ const STRINGS = {
     skipped: "Skipped",
     noData: "No server data available",
     fetchError: "Failed to fetch server list",
-    note: "Latency is measured in-browser via HTTPS fetch to port 4000. TCP handshake time from Resource Timing is used first; when unavailable, elapsed time until fetch error is used.",
+    note: "Latency is measured in-browser via HTTPS fetch to port 4000. TCP handshake time from Resource Timing is used first. When unavailable, elapsed time until fetch error is used with a calibration factor.",
     allGroupsDown: "All servers unreachable",
   },
   ja: {
@@ -70,7 +70,7 @@ const STRINGS = {
     skipped: "スキップ",
     noData: "サーバーデータを取得できません",
     fetchError: "サーバーリストの取得に失敗しました",
-    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間を使用します。",
+    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間に補正係数を適用します。",
     allGroupsDown: "全サーバー到達不可",
   },
 };
@@ -178,10 +178,11 @@ const geoQueue = {
 
 // ─── Ping measurement ───────────────────────────────────────────────
 // Browser-only measurement via HTTPS fetch + Resource Timing API.
-// No prediction/correction is applied.
+// If only fetch-error timing is available, apply a calibration factor.
 const MIN_VALID_PING_MS = 1;
 const MAX_VALID_PING_MS = 4000;
 const REQUEST_TIMEOUT_MS = 4000;
+const FETCH_ERROR_CORRECTION_FACTOR = 0.23;
 
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
@@ -222,14 +223,17 @@ async function measurePing(ip, port = 4000, attempts = 3) {
 
       const entry = await rtPromise;
       let sample = null;
+      let sampleSource = "none";
       if (entry) {
         const tcp = entry.connectEnd - entry.connectStart;
         if (tcp >= MIN_VALID_PING_MS && tcp < MAX_VALID_PING_MS) {
           sample = tcp;
+          sampleSource = "tcp";
         } else if (entry.responseStart > 0 && entry.requestStart > 0) {
           const ttfb = entry.responseStart - entry.requestStart;
           if (ttfb >= MIN_VALID_PING_MS && ttfb < MAX_VALID_PING_MS) {
             sample = ttfb;
+            sampleSource = "ttfb";
           }
         }
       }
@@ -244,10 +248,14 @@ async function measurePing(ip, port = 4000, attempts = 3) {
           wallTime < MAX_VALID_PING_MS
         ) {
           sample = wallTime;
+          sampleSource = "fetch-error";
         }
       }
 
       if (sample !== null) {
+        if (sampleSource === "fetch-error") {
+          sample = sample * FETCH_ERROR_CORRECTION_FACTOR;
+        }
         results.push(sample);
       }
     } catch {
@@ -718,24 +726,13 @@ function ServerRow({ server, lang, geo }) {
     pingStyle = { ...styles.pingValue, color: "#444" };
   } else if (ping !== null) {
     pingDisplay = `${ping}ms`;
-    if (ping < 50) pingStyle = { ...styles.pingValue, color: "#fff" };
-    else if (ping < 100) pingStyle = { ...styles.pingValue, color: "#aaa" };
-    else pingStyle = { ...styles.pingValue, color: "#666" };
+    if (ping < 80) pingStyle = { ...styles.pingValue, color: "#29c46a" };
+    else if (ping < 160) pingStyle = { ...styles.pingValue, color: "#f0c53a" };
+    else pingStyle = { ...styles.pingValue, color: "#eb5757" };
   } else {
     pingDisplay = t(lang, "down");
     pingStyle = { ...styles.pingValue, color: "#555" };
   }
-
-  // Ping bar width (max 300ms for visual scale)
-  const barWidth = ping !== null ? Math.min((ping / 300) * 100, 100) : 0;
-  const barColor =
-    ping !== null
-      ? ping < 50
-        ? "#fff"
-        : ping < 100
-          ? "#888"
-          : "#555"
-      : "transparent";
 
   // Show geo info only for servers that responded
   const showGeo = ping !== null && geo && (geo.flag || geo.country);
@@ -755,15 +752,6 @@ function ServerRow({ server, lang, geo }) {
         )}
       </div>
       <div className="ping-section" style={styles.pingSection}>
-        <div style={styles.pingBar}>
-          <div
-            style={{
-              ...styles.pingBarFill,
-              width: `${barWidth}%`,
-              backgroundColor: barColor,
-            }}
-          />
-        </div>
         <span style={pingStyle}>{pingDisplay}</span>
       </div>
     </div>
@@ -980,28 +968,15 @@ const styles = {
   pingSection: {
     display: "flex",
     alignItems: "center",
-    gap: 12,
+    justifyContent: "flex-end",
     flexShrink: 0,
     minWidth: 100,
-  },
-  pingBar: {
-    width: 60,
-    height: 3,
-    background: "#1a1a1a",
-    borderRadius: 2,
-    overflow: "hidden",
-    flexShrink: 0,
-  },
-  pingBarFill: {
-    height: "100%",
-    borderRadius: 2,
-    transition: "width 0.3s ease",
   },
   pingValue: {
     fontFamily: "'JetBrains Mono', monospace",
     fontSize: 12,
     fontWeight: 500,
-    minWidth: 64,
+    minWidth: 68,
     textAlign: "right",
   },
   // Note
