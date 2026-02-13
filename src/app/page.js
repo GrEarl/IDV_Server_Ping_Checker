@@ -592,6 +592,7 @@ function RegionPanel({ region, data, lang, scanning, geoInfo }) {
   const servers = data.servers || [];
   const hasGroups = region.hasGroups;
   const activeGroup = data.activeGroup;
+  const isRegionMeasuring = scanning && !data.done;
 
   // For grouped regions: only show active group servers, hide dead group entirely
   let displayServers = servers;
@@ -651,6 +652,9 @@ function RegionPanel({ region, data, lang, scanning, geoInfo }) {
       <div style={styles.panelHeader}>
         <div style={styles.panelTitleRow}>
           <h2 style={styles.panelTitle}>{t(lang, region.labelKey)}</h2>
+          {isRegionMeasuring && (
+            <span style={styles.regionScanStatus}>{t(lang, "measuring")}</span>
+          )}
         </div>
         {groupBadgeText && (
           <div style={styles.groupBadgeRow}>
@@ -870,6 +874,13 @@ const styles = {
     fontWeight: 600,
     color: "#ccc",
     margin: 0,
+  },
+  regionScanStatus: {
+    fontSize: 11,
+    fontWeight: 500,
+    color: "#f0c53a",
+    fontFamily: "'JetBrains Mono', monospace",
+    letterSpacing: "0.02em",
   },
   groupBadgeRow: {
     marginTop: 8,
