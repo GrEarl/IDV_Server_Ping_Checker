@@ -1,5 +1,5 @@
 // Server-side geo lookup with in-memory cache.
-// Mixes ip-api batch + json lookups in parallel and enriches missing org fields.
+// Uses multiple providers in parallel to reduce single-provider rate-limit impact.
 // POST /api/geo  body: { ips: ["1.2.3.4", "5.6.7.8"] }
 // Returns: { results: { "1.2.3.4": { country_code, country, org }, ... } }
 
@@ -8,9 +8,10 @@ const geoCache = new Map();
 const EMPTY_INFO = { country_code: "", country: "", org: "" };
 const IP_API_BATCH_URL = "http://ip-api.com/batch";
 const IP_API_JSON_BASE = "http://ip-api.com/json";
+const IPWHOIS_BASE_URL = "https://ipwho.is";
 const IP_API_FIELDS = "status,country,countryCode,org,isp,as,asname,query";
 const JSON_LOOKUP_CONCURRENCY = 8;
-const JSON_LOOKUP_MOD = 4; // ~25% of IPs go to json endpoint first
+const IPWHOIS_LOOKUP_CONCURRENCY = 8;
 
 function hasGeoInfo(info) {
   return !!(info?.country_code || info?.country || info?.org);
@@ -25,6 +26,21 @@ function normalizeInfo(record) {
   };
 }
 
+function normalizeIpWhoisInfo(record) {
+  if (!record || record.success === false) return { ...EMPTY_INFO };
+  const connection = record.connection || {};
+  return {
+    country_code: (record.country_code || "").toUpperCase(),
+    country: record.country || "",
+    org:
+      connection.org ||
+      connection.isp ||
+      connection.asn ||
+      connection.domain ||
+      "",
+  };
+}
+
 function mergeInfo(primary, secondary) {
   return {
     country_code: secondary.country_code || primary.country_code || "",
@@ -33,10 +49,16 @@ function mergeInfo(primary, secondary) {
   };
 }
 
-function shouldUseJsonFirst(ip) {
+function selectPrimaryProvider(ip) {
   const last = Number(ip.split(".").at(-1));
-  if (!Number.isFinite(last)) return false;
-  return last % JSON_LOOKUP_MOD === 0;
+  if (!Number.isFinite(last)) return "batch";
+
+  // Load split by deterministic bucket:
+  // 50% batch, 16.7% ip-api/json, 33.3% ipwho.is
+  const bucket = last % 6;
+  if (bucket === 0 || bucket === 1) return "ipwhois";
+  if (bucket === 2) return "json";
+  return "batch";
 }
 
 async function lookupBatch(ips) {
@@ -68,7 +90,7 @@ async function lookupBatch(ips) {
   return out;
 }
 
-async function lookupJsonOne(ip) {
+async function lookupIpApiJsonOne(ip) {
   try {
     const res = await fetch(
       `${IP_API_JSON_BASE}/${ip}?fields=${encodeURIComponent(IP_API_FIELDS)}`
@@ -81,7 +103,7 @@ async function lookupJsonOne(ip) {
   }
 }
 
-async function lookupJsonMany(ips) {
+async function lookupIpApiJsonMany(ips) {
   const out = {};
   if (ips.length === 0) return out;
 
@@ -91,7 +113,36 @@ async function lookupJsonMany(ips) {
     async () => {
       while (index < ips.length) {
         const ip = ips[index++];
-        out[ip] = await lookupJsonOne(ip);
+        out[ip] = await lookupIpApiJsonOne(ip);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return out;
+}
+
+async function lookupIpWhoisOne(ip) {
+  try {
+    const res = await fetch(`${IPWHOIS_BASE_URL}/${ip}`);
+    if (!res.ok) return { ...EMPTY_INFO };
+    const row = await res.json();
+    return normalizeIpWhoisInfo(row);
+  } catch {
+    return { ...EMPTY_INFO };
+  }
+}
+
+async function lookupIpWhoisMany(ips) {
+  const out = {};
+  if (ips.length === 0) return out;
+
+  let index = 0;
+  const workers = Array.from(
+    { length: Math.min(IPWHOIS_LOOKUP_CONCURRENCY, ips.length) },
+    async () => {
+      while (index < ips.length) {
+        const ip = ips[index++];
+        out[ip] = await lookupIpWhoisOne(ip);
       }
     }
   );
@@ -131,40 +182,52 @@ export async function POST(request) {
 
   if (uncached.length > 0) {
     const batchIps = [];
-    const jsonIps = [];
+    const ipApiJsonIps = [];
+    const ipWhoisIps = [];
     for (const ip of uncached) {
-      if (shouldUseJsonFirst(ip)) jsonIps.push(ip);
+      const provider = selectPrimaryProvider(ip);
+      if (provider === "json") ipApiJsonIps.push(ip);
+      else if (provider === "ipwhois") ipWhoisIps.push(ip);
       else batchIps.push(ip);
     }
-    const jsonFirstSet = new Set(jsonIps);
+    const ipApiJsonSet = new Set(ipApiJsonIps);
+    const ipWhoisSet = new Set(ipWhoisIps);
 
-    // Distribute load across batch/json endpoints and run both in parallel.
-    const [batchMap, jsonMap] = await Promise.all([
+    // Distribute load across providers and run lookups in parallel.
+    const [batchMap, ipApiJsonMap, ipWhoisMap] = await Promise.all([
       lookupBatch(batchIps),
-      lookupJsonMany(jsonIps),
+      lookupIpApiJsonMany(ipApiJsonIps),
+      lookupIpWhoisMany(ipWhoisIps),
     ]);
 
     for (const ip of uncached) {
       const fromBatch = batchMap[ip] || { ...EMPTY_INFO };
-      const fromJson = jsonMap[ip] || { ...EMPTY_INFO };
-      const info = mergeInfo(fromBatch, fromJson);
+      const fromIpApiJson = ipApiJsonMap[ip] || { ...EMPTY_INFO };
+      const fromIpWhois = ipWhoisMap[ip] || { ...EMPTY_INFO };
+      const mergedPrimary = mergeInfo(fromBatch, fromIpApiJson);
+      const info = mergeInfo(mergedPrimary, fromIpWhois);
       results[ip] = info;
       if (hasGeoInfo(info)) {
         geoCache.set(ip, info);
       }
     }
 
-    // Enrich missing country/org using json lookup for batch-first IPs.
+    // Enrich missing fields by querying providers not used as primary for that IP.
     const needsEnrichment = uncached.filter(
-      (ip) =>
-        !jsonFirstSet.has(ip) &&
-        (!results[ip] || !results[ip].country || !results[ip].org)
+      (ip) => !results[ip] || !results[ip].country || !results[ip].org
     );
     if (needsEnrichment.length > 0) {
-      const enrichMap = await lookupJsonMany(needsEnrichment);
+      const enrichJsonIps = needsEnrichment.filter((ip) => !ipApiJsonSet.has(ip));
+      const enrichIpWhoisIps = needsEnrichment.filter((ip) => !ipWhoisSet.has(ip));
+      const [enrichJsonMap, enrichIpWhoisMap] = await Promise.all([
+        lookupIpApiJsonMany(enrichJsonIps),
+        lookupIpWhoisMany(enrichIpWhoisIps),
+      ]);
+
       for (const ip of needsEnrichment) {
-        const enriched = enrichMap[ip] || { ...EMPTY_INFO };
-        const merged = mergeInfo(results[ip] || { ...EMPTY_INFO }, enriched);
+        const base = results[ip] || { ...EMPTY_INFO };
+        const withJson = mergeInfo(base, enrichJsonMap[ip] || { ...EMPTY_INFO });
+        const merged = mergeInfo(withJson, enrichIpWhoisMap[ip] || { ...EMPTY_INFO });
         results[ip] = merged;
         if (hasGeoInfo(merged)) {
           geoCache.set(ip, merged);
