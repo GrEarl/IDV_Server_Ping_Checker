@@ -199,44 +199,83 @@ function calibrateFetchErrorMs(rawMs) {
   return rawMs * coeff;
 }
 
+async function getResourceTimingEntry(url) {
+  if (
+    typeof performance === "undefined" ||
+    typeof performance.getEntriesByName !== "function"
+  ) {
+    return null;
+  }
+
+  const readLatest = () => {
+    const entries = performance.getEntriesByName(url, "resource");
+    if (!entries || entries.length === 0) return null;
+    return entries[entries.length - 1];
+  };
+
+  const immediate = readLatest();
+  if (immediate) return immediate;
+
+  if (typeof PerformanceObserver === "undefined") return null;
+
+  return new Promise((resolve) => {
+    let done = false;
+    let observer = null;
+    const finish = (entry) => {
+      if (done) return;
+      done = true;
+      if (observer) observer.disconnect();
+      resolve(entry);
+    };
+
+    try {
+      observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (entry.name === url) {
+            finish(entry);
+            return;
+          }
+        }
+      });
+      // Safari may not support `buffered` for `type: "resource"`.
+      try {
+        observer.observe({ type: "resource", buffered: true });
+      } catch {
+        observer.observe({ entryTypes: ["resource"] });
+      }
+    } catch {
+      finish(null);
+      return;
+    }
+
+    setTimeout(() => {
+      finish(readLatest());
+    }, 250);
+  });
+}
+
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
 
   for (let i = 0; i < attempts; i++) {
     const url = `https://${ip}:${port}/?_=${Date.now()}_${i}_${Math.random()}`;
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+    let abortedByTimer = false;
+    const timer = setTimeout(() => {
+      abortedByTimer = true;
+      ac.abort();
+    }, REQUEST_TIMEOUT_MS);
 
     try {
-      const rtPromise = new Promise((resolve) => {
-        const observer = new PerformanceObserver((list) => {
-          for (const entry of list.getEntries()) {
-            if (entry.name === url) {
-              observer.disconnect();
-              resolve(entry);
-              return;
-            }
-          }
-        });
-        observer.observe({ type: "resource", buffered: true });
-        setTimeout(() => {
-          observer.disconnect();
-          resolve(null);
-        }, 5000);
-      });
-
-      let fetchErrorName = "";
       const t0 = performance.now();
       await fetch(url, {
         mode: "no-cors",
         cache: "no-store",
         signal: ac.signal,
-      }).catch((err) => {
-        fetchErrorName = err?.name || "";
-      });
+      }).catch(() => {});
       const wallTime = performance.now() - t0;
 
-      const entry = await rtPromise;
+      const entry = await getResourceTimingEntry(url);
       let sample = null;
       let sampleSource = "none";
       if (entry) {
@@ -253,10 +292,9 @@ async function measurePing(ip, port = 4000, attempts = 3) {
         }
       }
       if (sample === null) {
-        const likelyAbort =
-          ac.signal.aborted ||
-          fetchErrorName === "AbortError" ||
-          wallTime >= REQUEST_TIMEOUT_MS - 20;
+        // Safari/iOS can report non-timeout TLS failures as AbortError.
+        // Treat only timer-triggered abort as an actual timeout.
+        const likelyAbort = abortedByTimer;
         if (
           !likelyAbort &&
           wallTime >= MIN_VALID_PING_MS &&
