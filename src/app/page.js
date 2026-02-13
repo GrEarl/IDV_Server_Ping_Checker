@@ -35,7 +35,7 @@ const STRINGS = {
     skipped: "Skipped",
     noData: "No server data available",
     fetchError: "Failed to fetch server list",
-    note: "Latency is measured via TCP connection time to port 4000 from your browser. Values closely approximate ICMP ping (1 RTT).",
+    note: "Latency is measured via TCP connection time to port 4000 over HTTPS from your browser. Values closely approximate ICMP ping (1 RTT).",
     allGroupsDown: "All servers unreachable",
   },
   ja: {
@@ -70,7 +70,7 @@ const STRINGS = {
     skipped: "スキップ",
     noData: "サーバーデータを取得できません",
     fetchError: "サーバーリストの取得に失敗しました",
-    note: "遅延はブラウザからポート4000へのTCP接続時間で測定しています。ICMPのpingに近い値（1 RTT）が得られます。",
+    note: "遅延はブラウザからHTTPS経由でポート4000へのTCP接続時間で測定しています。ICMPのpingに近い値（1 RTT）が得られます。",
     allGroupsDown: "全サーバー到達不可",
   },
 };
@@ -181,16 +181,15 @@ const geoQueue = {
 // TCP handshake = exactly 1 RTT, same as ICMP ping.
 // Falls back to performance.now() wall-clock timing if Resource Timing unavailable.
 //
-// Correction coefficient: TCP connect via browser may include minor overhead
-// (process scheduling, JS event loop). A factor of 0.95 compensates for typical
-// browser-side overhead so the displayed value more closely matches ICMP ping.
-// Set to 1.0 to disable correction.
-const PING_CORRECTION_FACTOR = 0.95;
+// TCP connect time (connectEnd - connectStart) = exactly 1 RTT, same as ICMP ping.
+// No correction needed since we measure the raw TCP handshake via Resource Timing.
+const PING_CORRECTION_FACTOR = 1.0;
+const MIN_VALID_PING_MS = 3;
 async function measurePing(ip, port = 4000, attempts = 3) {
   const results = [];
 
   for (let i = 0; i < attempts; i++) {
-    const url = `http://${ip}:${port}/?_=${Date.now()}_${i}_${Math.random()}`;
+    const url = `https://${ip}:${port}/?_=${Date.now()}_${i}_${Math.random()}`;
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 4000);
 
@@ -227,15 +226,15 @@ async function measurePing(ip, port = 4000, attempts = 3) {
       if (entry) {
         // Best: TCP handshake time = exactly 1 RTT (same as ICMP ping)
         const tcp = entry.connectEnd - entry.connectStart;
-        if (tcp > 0 && tcp < 4000) {
+        if (tcp >= MIN_VALID_PING_MS && tcp < 4000) {
           results.push(tcp);
         } else if (entry.responseStart > 0 && entry.requestStart > 0) {
           const ttfb = entry.responseStart - entry.requestStart;
-          if (ttfb > 0 && ttfb < 4000) results.push(ttfb);
-        } else if (wallTime > 0 && wallTime < 4000) {
+          if (ttfb >= MIN_VALID_PING_MS && ttfb < 4000) results.push(ttfb);
+        } else if (wallTime >= MIN_VALID_PING_MS && wallTime < 4000) {
           results.push(wallTime);
         }
-      } else if (wallTime > 0 && wallTime < 4000) {
+      } else if (wallTime >= MIN_VALID_PING_MS && wallTime < 4000) {
         results.push(wallTime);
       }
     } catch {
@@ -254,7 +253,7 @@ async function measurePing(ip, port = 4000, attempts = 3) {
   // Use median for stability
   results.sort((a, b) => a - b);
   const median = results[Math.floor(results.length / 2)];
-  // Apply correction coefficient to compensate for browser overhead
+  // Correction factor is 1.0 by default (raw TCP handshake RTT).
   return Math.max(1, Math.round(median * PING_CORRECTION_FACTOR));
 }
 
@@ -342,13 +341,14 @@ export default function Home() {
 
   return (
     <div style={styles.page}>
-      <div style={styles.container}>
+      <div className="container" style={styles.container}>
         {/* Header */}
-        <header style={styles.header}>
-          <h1 style={styles.title}>Identity V Game Server Ping Checker</h1>
-          <p style={styles.subtitle}>{t(lang, "subtitle")}</p>
-          <div style={styles.headerActions}>
+        <header className="header" style={styles.header}>
+          <h1 className="title" style={styles.title}>Identity V Game Server Ping Checker</h1>
+          <p className="subtitle" style={styles.subtitle}>{t(lang, "subtitle")}</p>
+          <div className="header-actions" style={styles.headerActions}>
             <button
+              className="scan-btn"
               style={scanning ? styles.btnDisabled : styles.btn}
               onClick={startScan}
               disabled={scanning}
@@ -360,6 +360,7 @@ export default function Home() {
                   : t(lang, "startScan")}
             </button>
             <button
+              className="lang-btn"
               style={styles.langBtn}
               onClick={() => setLang(lang === "en" ? "ja" : "en")}
             >
@@ -369,7 +370,7 @@ export default function Home() {
         </header>
 
         {/* Region panels */}
-        <div style={styles.grid}>
+        <div className="grid" style={styles.grid}>
           {ACTIVE_REGIONS.map((region) => (
             <RegionPanel
               key={region.id}
@@ -624,7 +625,7 @@ function RegionPanel({ region, data, lang, scanning, geoInfo }) {
         )}
         {/* Stats bar (only for non-test servers with multiple IPs) */}
         {hasGroups && doneServers.length > 0 && (
-          <div style={styles.statsBar}>
+          <div className="stats-bar" style={styles.statsBar}>
             <Stat
               label={t(lang, "responded")}
               value={upServers.length}
@@ -729,11 +730,11 @@ function ServerRow({ server, lang, geo }) {
   const showGeo = ping !== null && geo && (geo.flag || geo.country);
 
   return (
-    <div style={styles.serverRow}>
-      <div style={styles.serverInfo}>
+    <div className="server-row" style={styles.serverRow}>
+      <div className="server-info" style={styles.serverInfo}>
         <span style={styles.serverIp}>{ip}</span>
         {showGeo && (
-          <span style={styles.geoInfo}>
+          <span className="geo-info" style={styles.geoInfo}>
             {geo.flag && <span style={styles.geoFlag}>{geo.flag}</span>}
             {geo.country && (
               <span style={styles.geoCountry}>{geo.country}</span>
@@ -742,7 +743,7 @@ function ServerRow({ server, lang, geo }) {
           </span>
         )}
       </div>
-      <div style={styles.pingSection}>
+      <div className="ping-section" style={styles.pingSection}>
         <div style={styles.pingBar}>
           <div
             style={{
@@ -769,7 +770,7 @@ const styles = {
   container: {
     maxWidth: 1200,
     margin: "0 auto",
-    padding: "40px 24px",
+    padding: "24px 16px",
   },
   header: {
     marginBottom: 40,
@@ -830,7 +831,7 @@ const styles = {
   },
   grid: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(480px, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(0, 1fr))",
     gap: 20,
   },
   // Panel
@@ -841,7 +842,7 @@ const styles = {
     overflow: "hidden",
   },
   panelHeader: {
-    padding: "16px 20px",
+    padding: "16px 12px",
     borderBottom: "1px solid #1a1a1a",
   },
   panelTitleRow: {
@@ -919,7 +920,7 @@ const styles = {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
-    padding: "8px 20px",
+    padding: "8px 12px",
     borderBottom: "1px solid #151515",
     gap: 16,
   },
@@ -970,7 +971,7 @@ const styles = {
     alignItems: "center",
     gap: 12,
     flexShrink: 0,
-    minWidth: 140,
+    minWidth: 100,
   },
   pingBar: {
     width: 60,
