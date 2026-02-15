@@ -26,7 +26,7 @@ export async function GET(request) {
       next: { revalidate: 300 }, // cache 5 min
     });
     const text = await res.text();
-    const servers = parseServerList(text);
+    const servers = parseServerList(text, region);
     return Response.json({ region, servers });
   } catch (e) {
     return Response.json(
@@ -36,7 +36,7 @@ export async function GET(request) {
   }
 }
 
-function parseServerList(text) {
+function parseServerList(text, region) {
   const lines = text
     .split("\n")
     .map((l) => l.trim())
@@ -55,9 +55,11 @@ function parseServerList(text) {
 
     // Validate IP
     if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
-    // Include known game ports:
-    // global servers: 4000, CN domestic servers: 10000
-    if (!((port >= 4000 && port <= 4999) || port === 10000)) continue;
+    // Port policy:
+    // - cnnormal (domestic): 10000
+    // - all global regions: 4000
+    const expectedPort = region === "cnnormal" ? 10000 : 4000;
+    if (port !== expectedPort) continue;
 
     const group = parts.length >= 9 ? parts[8] : null;
     const serverId = parts[0];
