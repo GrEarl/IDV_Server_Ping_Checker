@@ -1,7 +1,7 @@
 export const metadata = {
   title: "Identity V Game Server Ping Checker",
   description:
-    "Measure latency to Identity V game servers from your browser. Supports Asia, NA-EU, and test servers.",
+    "Measure latency to Identity V game servers from your browser. Supports Asia, China domestic, NA-EU, and test servers.",
 };
 
 export default function RootLayout({ children }) {

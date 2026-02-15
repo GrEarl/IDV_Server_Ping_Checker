@@ -9,12 +9,15 @@ const STRINGS = {
     scanning: "Scanning...",
     rescan: "Rescan",
     asia: "Asia Server",
+    china: "China Domestic Server",
     naeu: "NA-EU Server",
     asiaTest: "Asia Test Server",
     naeuTest: "NA-EU Test Server",
     // Asia group labels
     asiaSEA: "Southeast Asia Block",
     asiaEastJP: "East Asia / Japan Block",
+    chinaA: "Mainland Block A",
+    chinaB: "Mainland Block B",
     // NA-EU group labels
     naeuNA: "North America Block",
     naeuEU: "Europe Block",
@@ -35,7 +38,7 @@ const STRINGS = {
     skipped: "Skipped",
     noData: "No server data available",
     fetchError: "Failed to fetch server list",
-    note: "Latency is measured in-browser via HTTPS fetch to port 4000. TCP handshake time from Resource Timing is used first. When unavailable, elapsed time until fetch error is corrected with an adaptive factor.",
+    note: "Latency is measured in-browser via HTTPS fetch to each server's game port. TCP handshake time from Resource Timing is used first. When unavailable, elapsed time until fetch error is corrected with an adaptive factor.",
     allGroupsDown: "All servers unreachable",
   },
   ja: {
@@ -44,12 +47,15 @@ const STRINGS = {
     scanning: "スキャン中...",
     rescan: "再スキャン",
     asia: "アジアサーバー",
+    china: "中国国内版サーバー",
     naeu: "NA-EUサーバー",
     asiaTest: "アジアテストサーバー",
     naeuTest: "NA-EUテストサーバー",
     // Asia group labels
     asiaSEA: "東南アジアブロック",
     asiaEastJP: "東アジア（日本）ブロック",
+    chinaA: "中国本土ブロックA",
+    chinaB: "中国本土ブロックB",
     // NA-EU group labels
     naeuNA: "北米ブロック",
     naeuEU: "欧州ブロック",
@@ -70,7 +76,7 @@ const STRINGS = {
     skipped: "スキップ",
     noData: "サーバーデータを取得できません",
     fetchError: "サーバーリストの取得に失敗しました",
-    note: "遅延はブラウザ内のHTTPS fetchでポート4000に対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間に可変補正係数を適用します。",
+    note: "遅延はブラウザ内のHTTPS fetchで各サーバーのゲームポートに対して測定しています。Resource TimingのTCP接続時間を優先し、取得できない場合はfetchエラー到達までの経過時間に可変補正係数を適用します。",
     allGroupsDown: "全サーバー到達不可",
   },
 };
@@ -93,6 +99,10 @@ function getGroupLabel(lang, regionId, group) {
   if (regionId === "asianormal") {
     if (group === "A") return t(lang, "asiaSEA");
     if (group === "B") return t(lang, "asiaEastJP");
+  }
+  if (regionId === "cnnormal") {
+    if (group === "A") return t(lang, "chinaA");
+    if (group === "B") return t(lang, "chinaB");
   }
   // NA-EU: A = North America, B = Europe
   if (group === "A") return t(lang, "naeuNA");
@@ -332,6 +342,7 @@ async function measurePing(ip, port = 4000, attempts = 3) {
 // ─── Region definitions ─────────────────────────────────────────────
 const REGIONS = [
   { id: "asianormal", labelKey: "asia", hasGroups: true },
+  { id: "cnnormal", labelKey: "china", hasGroups: true },
   { id: "usnormal", labelKey: "naeu", hasGroups: true },
   // Test servers — kept for reference but disabled from display
   { id: "asiatest", labelKey: "asiaTest", hasGroups: false, disabled: true },

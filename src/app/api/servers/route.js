@@ -1,5 +1,5 @@
 // Proxy for fetching game server lists (HTTP-only origins, no CORS)
-// GET /api/servers?region=asianormal|asiatest|usnormal|ustest
+// GET /api/servers?region=asianormal|asiatest|usnormal|ustest|cnnormal
 
 const URLS = {
   asianormal:
@@ -7,6 +7,7 @@ const URLS = {
   asiatest: "http://h55na.update.easebar.com/server_list_asiatest_game.txt",
   usnormal: "http://h55na.update.easebar.com/server_list_usnormal_game.txt",
   ustest: "http://h55na.update.easebar.com/server_list_ustest_game.txt",
+  cnnormal: "https://h55.update.netease.com/server_list_normal_game.txt",
 };
 
 export async function GET(request) {
@@ -54,8 +55,9 @@ function parseServerList(text) {
 
     // Validate IP
     if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
-    // Only include port 4000-4999
-    if (port < 4000 || port > 4999) continue;
+    // Include known game ports:
+    // global servers: 4000, CN domestic servers: 10000
+    if (!((port >= 4000 && port <= 4999) || port === 10000)) continue;
 
     const group = parts.length >= 9 ? parts[8] : null;
     const serverId = parts[0];
